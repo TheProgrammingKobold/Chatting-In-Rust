@@ -1,0 +1,10 @@
+[package]
+name = "chat_server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chat_common = { path = "../chat_common" }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+mini-redis = "0.4"
