@@ -1,0 +1,13 @@
+
+# Rust build artifacts
+**/target/
+
+# IDE files
+.vscode/
+.idea/
+.vs/
+
+# Local secrets and environment files
+.env
+.env.*
+!.env.example
