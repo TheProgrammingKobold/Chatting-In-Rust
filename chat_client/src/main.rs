@@ -1,59 +1,85 @@
-use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpStream, Shutdown};
-use std::println;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{TcpStream};
+use std::{println, io};
 
-use chat_common::{ClientMessage, MessageType};
+use chat_common::{ClientMessage, ServerMessage, MAX_MESSAGE_SIZE};
 
-fn recieve_data(mut stream: TcpStream) {
+async fn recieve_data(stream: OwnedReadHalf) {
+
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
+    let mut size_buffer = [0u8; 4];
 
     loop{
-        line.clear();
 
+        reader.read_exact(&mut size_buffer).await.unwrap();
+        let size_in_bytes = u32::from_be_bytes(size_buffer) as usize;
 
-        match reader.read_line(&mut line) {
-            Ok(0) => {
-                println!("Lost connection to server!");
-                break; // Important to break from the loop here!
-            }
-            Ok(_) => {
-                let chat_message: ClientMessage = 
-                match serde_json::from_str(&line) {
-                    Ok(message) => message,
-                    Err(e) => {
-                        println!("Failed to parse JSON: {}", e);
-                        continue;
-                    }
-                };
+        if size_in_bytes > MAX_MESSAGE_SIZE {
+            println!("Warning: Tried to recieve data that was larger than the maximum size! Packet Dropped!");
+            break;
+        }
 
-                println!("[{}]: {}", chat_message.username, chat_message.message);
-            }
+        let mut message_buffer = vec![0u8; size_in_bytes];
+
+        reader.read_exact(&mut message_buffer).await.unwrap();
+
+        let message: ServerMessage = match serde_json::from_slice(&message_buffer) {
+            Ok(message) => message,
             Err(e) => {
-                println!("Failed to recive data: {}", e);
-                break; // Also importnat to break here!
+                eprintln!("Invalid JSON from SERVER: {}", e);
+                continue;
             }
+        };
+
+
+        match message {
+            ServerMessage::Accept => {
+                println!("Server has accepted your connection!");
+            },
+            ServerMessage::Reject { reason } => {
+                println!("Server has rejected your connection: {}", reason);
+                break;
+            },
+            ServerMessage::Chat { username, message } => {
+                println!("[{}]: {}", username, message);
+            },
+            ServerMessage::Disconnect => {
+                println!("You have been disconnected from the server!");
+                break;
+            },
+            ServerMessage::Announce { message } => {
+                println!("[SERVER]: {}", message);
+            },
         }
     }
 }
 
-fn send_data(client_message: ClientMessage, stream: &mut TcpStream) -> bool {
-    let json = serde_json::to_string(&client_message).unwrap();
-    let json = format!("{}\n", json);
+async fn send_data(client_message: ClientMessage, stream: &mut OwnedWriteHalf) -> io::Result<()> {
+    let payload = serde_json::to_vec(&client_message)
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-    match stream.write_all(json.as_bytes()) {
-        Ok(()) => {
-            //println!("Sent: {}", message);
-            return true;
-        }
-        Err(e) => {
-            println!("Error sending bytes: {}", e);
-            return false;
-        }
+    if payload.len() > MAX_MESSAGE_SIZE {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Tried to send a message that was above the max message size!"));
     }
+
+
+    let size = u32::try_from(payload.len())
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&size.to_be_bytes());
+    frame.extend_from_slice(&payload);
+
+
+    stream.write_all(&frame).await?;
+
+    Ok(())
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let mut username = String::new();
 
     println!("Please Enter the username you'd like to use");
@@ -72,28 +98,16 @@ fn main() {
 
     let username = username.trim().to_string();
 
-    let mut stream = TcpStream::connect("127.0.0.1:7878").unwrap();
-    let mut stream_copy: TcpStream;
-    match stream.try_clone(){
-        Ok(cloned_stream) => {
-            stream_copy = cloned_stream;
-        }
-        Err(e) => {
-            println!("Error Copying the handle to the stream: {}", e);
-            return;
-        }
-    }
+    let mut stream = TcpStream::connect("127.0.0.1:7878").await.unwrap();
 
-    let announcement = ClientMessage {
-        kind: MessageType::Join,
-        username: username.clone(),
-        message: String::new(),
-    };
+    let announcement = ClientMessage::Join { username };
 
-    send_data(announcement, &mut stream_copy);
+    let (read_half, mut write_half) = stream.into_split();
 
-    let receiver = std::thread::spawn(move || {
-        recieve_data(stream);
+    send_data(announcement, &mut write_half).await.unwrap();
+
+    let receiver = tokio::spawn(async move {
+        recieve_data(read_half).await;
     });
 
     loop {
@@ -105,13 +119,9 @@ fn main() {
             }
             Ok(_) => {
 
-                let chat_message = ClientMessage {
-                    kind: MessageType::Chat,
-                    username: username.clone(),
-                    message: message.trim_end().to_string()
-                };
+                let chat_message = ClientMessage::Chat { message };
 
-                send_data(chat_message, &mut stream_copy);
+                send_data(chat_message, &mut write_half).await.unwrap();
 
             }
             Err(e) => {
@@ -121,24 +131,16 @@ fn main() {
         }
     }
 
-    let disconnect_message = ClientMessage {
-        kind: MessageType::Disconnect,
-        username: username.clone(),
-        message: String::new(),
-    };
+    let disconnect_message = ClientMessage::Disconnect {};
 
-    send_data(disconnect_message, &mut stream_copy);
+    send_data(disconnect_message, &mut write_half).await.unwrap();
 
-    if let Err(e) = stream_copy.shutdown(Shutdown::Both) {
-        println!("Error shutting down connection: {}", e);
-    }
-
-    match receiver.join() {
-        Ok(_) => {
+    match receiver.await {
+        Ok(()) => {
             
         }
         Err(e) => {
-            println!("Thread Failed to join: {:?}", e);
+            println!("Receiver Failed to join: {}", e);
         }
     }
 }

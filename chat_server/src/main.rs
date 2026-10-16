@@ -1,224 +1,265 @@
-use std::io::{BufReader, BufRead, Write};
-use std::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc;
+use tokio::net::{TcpListener, TcpStream};
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::{println, thread};
+use std::{eprint, io, println};
 
-use chat_common::{ClientMessage, MessageType};
+use chat_common::{ClientMessage, ServerMessage, OUTGOING_QUEUE_CAPACITY, MAX_MESSAGE_SIZE};
 
-type Clients = Arc<Mutex<Vec<TcpStream>>>;
+struct ConnectedClient {
+    username: String,
+    outgoing: mpsc::Sender<Vec<u8>>
+}
 
-fn broadcast_message(clients: &Clients, message: &ClientMessage) {
-    let json = match serde_json::to_string(message) {
-        Ok(json) => format!("{}\n", json),
+type Clients = Arc<Mutex<HashMap<SocketAddr, ConnectedClient>>>;
+
+fn encode_server_message(message: &ServerMessage) -> io::Result<Vec<u8>> {
+    let payload = serde_json::to_vec(message)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    if payload.len() > MAX_MESSAGE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Server message exceeds maximum size",
+        ));
+    }
+
+    let size = u32::try_from(payload.len())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&size.to_be_bytes());
+    frame.extend_from_slice(&payload);
+
+    Ok(frame)
+}
+
+fn broadcast_message(clients: &Clients, message: &ServerMessage, excluded: Option<SocketAddr>) {
+     // Encode the message once, before distributing it.
+    let frame = match encode_server_message(message) {
+        Ok(frame) => frame,
         Err(e) => {
-            println!("Failed to steralize announcement: {}", e);
+            eprintln!("Failed to encode server message: {}", e);
             return;
-        }
-    };
+    }
+};
 
     let mut connected = match clients.lock() {
         Ok(connected) => connected,
         Err(e) => {
-            println!("Failed to lock clients: {}", e);
+            eprintln!("Failed to lock client registry: {}", e);
             return;
         }
     };
 
-    connected.retain_mut(|client| {
-        match client.write_all(json.as_bytes()) {
-            Ok(()) => true,
-            Err(e) => {
-                println!("Failed to send to a client: {}", e);
-                false
+    let mut closed_clients = Vec::new();
+
+    for (address, client) in connected.iter() {
+        if Some(*address) == excluded {
+            continue;
+        }
+
+        match client.outgoing.try_send(frame.clone()) {
+            Ok(()) => {}
+
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Don't let a slow client block everybody else.
+                // This individual message is dropped for that client.
+                eprintln!(
+                    "Outgoing queue full for {}; dropping message",
+                    address
+                );
             }
-        }
-    });
-}
 
-fn handle_client(mut stream: TcpStream, clients: Clients) {
-    let address = match stream.peer_addr() {
-        Ok(addr) => addr,
-        Err(e) => {
-            println!("Failed to get client address: {}", e);
-            return;
-        }
-    };
-
-    // Clone the stream so the shared client list can send messages to this client.
-    let client_stream = match stream.try_clone() {
-        Ok(s) => s,
-        Err(e) => {
-            println!("Failed to clone client stream: {}", e);
-            return;
-        }
-    };
-
-    // Register this client.
-    match clients.lock() {
-        Ok(mut connected) => connected.push(client_stream),
-        Err(e) => {
-            println!("Failed to lock client list: {}", e);
-            return;
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                closed_clients.push(*address);
+            }
         }
     }
 
-    println!("Registered client: {}", address);
+    for address in closed_clients {
+        connected.remove(&address);
+    }
+}
 
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
+async fn handle_client(
+    stream: TcpStream,
+    address: SocketAddr,
+    clients: Clients,
+) {
+    println!("TCP connection from {}", address);
 
+    // Split this socket into an independently owned reader and writer.
+    let (read_half, mut write_half) = stream.into_split();
+
+    // The reader task sends outgoing messages through this channel.
+    let (outgoing_tx, mut outgoing_rx) =
+        mpsc::channel::<Vec<u8>>(OUTGOING_QUEUE_CAPACITY);
+
+    // Dedicated writer task: wait for queued messages and send them.
+    tokio::spawn(async move {
+        while let Some(frame) = outgoing_rx.recv().await {
+            if let Err(e) = write_half.write_all(&frame).await {
+                eprintln!("Failed to write to {}: {}", address, e);
+                break;
+            }
+        }
+    });
+
+    let mut reader = BufReader::new(read_half);
+    let mut size_buffer = [0u8; 4];
     let mut username = String::new();
 
     loop {
-        line.clear();
+        if let Err(e) = reader.read_exact(&mut size_buffer).await {
+            eprintln!("Failed to read frame header from {}: {}", address, e);
+            break;
+        }
+        let size_in_bytes = u32::from_be_bytes(size_buffer) as usize;
 
-        match reader.read_line(&mut line) {
-            Ok(0) => {
-                println!("Client disconnected: {}", address);
-                break;
+        if size_in_bytes > MAX_MESSAGE_SIZE {
+            println!("Warning: Tried to recieve data that was larger than the maximum size! Packet Dropped!");
+            break;
+        }
+
+        let mut message_buffer = vec![0u8; size_in_bytes];
+
+        if let Err(e) = reader.read_exact(&mut message_buffer).await {
+            eprint!("Failed to read frame from payload {}: {}", address, e);
+        };
+
+        let message: ClientMessage = match serde_json::from_slice(&message_buffer) {
+            Ok(message) => message,
+            Err(e) => {
+                eprintln!("Invalid JSON from {}: {}", address, e);
+                continue;
             }
-            Ok(_) => {
-                let message: ClientMessage = 
-                match serde_json::from_str(&line) {
-                    Ok(message) => message,
+        };
+
+        match message {
+            ClientMessage::Join { username: requested_username } => {
+                if !username.is_empty() {
+                    continue;
+                }
+
+                let requested_username = requested_username.trim();
+
+                if requested_username.is_empty() {
+                    let rejection = ServerMessage::Reject {
+                        reason: "Username cannot be empty.".to_string(),
+                    };
+
+                    match encode_server_message(&rejection) {
+                        Ok(frame) => {
+                            if let Err(e) = outgoing_tx.send(frame).await {
+                                eprintln!("Failed to send rejection to {}: {}", address, e);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to encode rejection: {}", e);
+                        }
+                    }
+
+                    // Reject the connection instead of continuing to process requests.
+                    break;
+                }
+
+                username = requested_username.to_string();
+
+                // Only joined clients are added to the broadcast registry.
+                match clients.lock() {
+                    Ok(mut connected) => {
+                        connected.insert(
+                            address,
+                            ConnectedClient {
+                                username: username.clone(),
+                                outgoing: outgoing_tx.clone(),
+                            },
+                        );
+                    }
+
                     Err(e) => {
-                        println!("Invalide message from {}: {}", address, e);
-                        continue;
-                    }
-                };
-
-                match message.kind {
-                    MessageType::Join => {
-                        // Only accept the first Join request.
-                        if !username.is_empty() {
-                            continue;
-                        }
-
-                        username = message.username.trim().to_string();
-
-                        let announcement = ClientMessage {
-                            kind: MessageType::Chat,
-                            username: "SERVER".to_string(),
-                            message: format!("{} has joined the channel!", username),
-                        };
-
-                        broadcast_message(&clients, &announcement);
-                    }
-
-                    MessageType::Chat => {
-
-                        if username.is_empty() {
-                            println!("Client tried to chat before joining: {}", address);
-                            continue;
-                        }
-
-                        let json = match serde_json::to_string(&message) {
-                            Ok(json) => format!("{}\n", json),
-                            Err(e) => {
-                                println!("Failed to serialize message: {}", e);
-                                continue;
-                            }
-                        };
-
-                        // Broadcast the message to all connected clients.
-                        let mut connected = match clients.lock() {
-                            Ok(connected) => connected,
-                            Err(e) => {
-                                println!("Failed to lock client list: {}", e);
-                                break;
-                            }
-                        };
-
-                        connected.retain_mut(|client| {
-                            
-                            let is_sender = client.peer_addr().map(|addr| addr == address).unwrap_or(false);
-
-                            if is_sender {
-                                return true;
-                            }
-                            
-                            match client.write_all(json.as_bytes()) {
-                                Ok(()) => true,
-                                Err(e) => {
-                                    println!("Removing client after send failure: {}", e);
-                                    false
-                                }
-                            }
-                        });
-
-                        println!("{}: {}", message.username, message.message);
-
-                        // Broadcast the chat message to other clients.
-                    }
-
-                    MessageType::Disconnect => {
+                        eprintln!("Failed to lock client registry: {}", e);
+                        username.clear();
                         break;
                     }
                 }
 
+                println!("{} joined from {}", username, address);
 
+                let announcement = ServerMessage::Announce {
+                    message: format!("{} has joined the channel!", username)
+                };
+
+                // Include the newly joined client in the announcement.
+                broadcast_message(&clients, &announcement, None);
             }
-            Err(e) => {
-                println!("Error reading from {}: {}", address, e);
+
+            ClientMessage::Chat { message: text } => {
+                if username.is_empty() {
+                    eprintln!("Client tried to chat before joining: {}", address);
+                    continue;
+                }
+
+                println!("{}: {}", username, text);
+
+                let chat_message = ServerMessage::Chat {
+                    username: username.clone(),
+                    message: text,
+                };
+
+                broadcast_message(&clients, &chat_message, Some(address));
+            }
+
+            ClientMessage::Disconnect => {
                 break;
             }
         }
     }
-    // Save the username before cleaning up the connection.
-    let disconnected_username = username.clone();
 
-    // Remove this client's connection.
+    // Remove the client before broadcasting its departure.
     match clients.lock() {
         Ok(mut connected) => {
-            connected.retain(|client| {
-                client.peer_addr()
-                    .map(|addr| addr != address)
-                    .unwrap_or(false)
-            });
+            connected.remove(&address);
         }
+
         Err(e) => {
-            println!("Failed to lock clients during cleanup: {}", e);
+            eprintln!("Failed to lock client registry during cleanup: {}", e);
         }
     }
 
-    // Announce the departure after removing the disconnected client.
-    if !disconnected_username.is_empty() {
-        let announcement = ClientMessage {
-            kind: MessageType::Chat,
-            username: "SERVER".to_string(),
-            message: format!(
-                "{} has disconnected from the channel!",
-                disconnected_username
-            ),
+    println!("Client disconnected: {}", address);
+
+    if !username.is_empty() {
+        let announcement = ServerMessage::Announce {
+             message: format!("{} has disconnected from the channel!", username)
         };
 
-        broadcast_message(&clients, &announcement);
+        broadcast_message(&clients, &announcement, None);
     }
+
+    // Once all registry references are removed, dropping this sender lets
+    // the writer task finish after its queued messages have been sent.
+    drop(outgoing_tx);
 }
 
-fn main() {
-    let listener = match TcpListener::bind("127.0.0.1:7878") {
-        Ok(listener) => listener,
-        Err(e) => {
-            println!("Failed to bind server: {}", e);
-            return;
-        }
-    };
+#[tokio::main]
+async fn main() {
+    let listener = TcpListener::bind("127.0.0.1:7878").await.unwrap();
 
     println!("Server listening on 127.0.0.1:7878!");
 
-    let clients: Clients = Arc::new(Mutex::new(Vec::new()));
+    let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
 
-    for incoming in listener.incoming() {
-        match incoming {
-            Ok(stream) => {
-                let clients = Arc::clone(&clients);
+    loop {
+        let (socket, address) = listener.accept().await.unwrap();
+        let clients = Arc::clone(&clients);
 
-                thread::spawn(move || {
-                    handle_client(stream, clients);
-                });
-            }
-            Err(e) => println!("Failed to accept connection: {}", e),
-        }
+
+        tokio::spawn(async move {
+            handle_client(socket, address, clients).await;
+        });
     }
 }
