@@ -168,6 +168,34 @@ async fn handle_client(
 
                 username = requested_username.to_string();
 
+                let username_taken = {
+                    let connected = clients.lock().unwrap();
+
+                    connected.values().any(|client| {
+                        client.username.eq_ignore_ascii_case(requested_username)
+                    })
+                }; 
+                
+                if username_taken {
+                    let rejection = ServerMessage::Reject { reason: "Someone already has this username.".to_string() };
+                    
+                    match encode_server_message(&rejection) {
+                        Ok(frame) => {
+                            if let Err(e) = outgoing_tx.send(frame).await {
+                                eprintln!("Failed to send rejection to {}: {}", address, e);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to encode rejection: {}", e);
+                        }
+                    }
+
+                    username = String::from("USER_TAKEN");
+
+                    // Important to break from the connection! 
+                    break;
+                }
+
                 // Only joined clients are added to the broadcast registry.
                 match clients.lock() {
                     Ok(mut connected) => {

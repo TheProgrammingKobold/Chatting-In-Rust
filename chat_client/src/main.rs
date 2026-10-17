@@ -98,7 +98,7 @@ async fn main() {
 
     let username = username.trim().to_string();
 
-    let mut stream = TcpStream::connect("127.0.0.1:7878").await.unwrap();
+    let stream = TcpStream::connect("127.0.0.1:7878").await.unwrap();
 
     let announcement = ClientMessage::Join { username };
 
