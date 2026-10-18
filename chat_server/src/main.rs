@@ -4,7 +4,7 @@ use tokio::net::{TcpListener, TcpStream};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::{eprint, eprintln, io, println};
+use std::{eprintln, io, println};
 
 use chat_common::{ClientMessage, ServerMessage, OUTGOING_QUEUE_CAPACITY, MAX_MESSAGE_SIZE};
 
